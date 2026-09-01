@@ -10,6 +10,11 @@ namespace nigiri::routing {
 
 static constexpr auto kMinLookAhead = 1_days;
 
+enum class pong_replay_mode {
+  kDisabled,
+  kNonRtPing,
+};
+
 std::optional<std::array<journey::leg, 3U>> get_earliest_alternative(
     timetable const&,
     rt_timetable const*,
@@ -26,7 +31,8 @@ routing_result pong_search(
     search_state&,
     AlgoState&,
     query,
-    direction search_dir,
-    std::optional<std::chrono::seconds> timeout = std::nullopt);
+    direction,
+    std::optional<std::chrono::seconds> timeout = std::nullopt,
+    pong_replay_mode = pong_replay_mode::kNonRtPing);
 
 }  // namespace nigiri::routing

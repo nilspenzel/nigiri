@@ -14,9 +14,9 @@
 
 #include "nigiri/location_match_mode.h"
 #include "nigiri/routing/direct.h"
-#include "nigiri/routing/get_earliest_transport.h"
 #include "nigiri/routing/gpu/raptor.h"
 #include "nigiri/routing/leg_alternatives.h"
+#include "nigiri/routing/raptor/pong_replay.h"
 #include "nigiri/routing/transfer_time_settings.h"
 #include "nigiri/rt/frun.h"
 #include "nigiri/types.h"
@@ -65,7 +65,8 @@ routing_result pong(timetable const& tt,
                     search_state& s_state,
                     AlgoState& r_state,
                     query q,
-                    std::optional<std::chrono::seconds> timeout) {
+                    std::optional<std::chrono::seconds> timeout,
+                    pong_replay_mode const replay_mode) {
   constexpr auto kFwd = (SearchDir == direction::kForward);
 
   using ping_algo_t =
@@ -103,6 +104,10 @@ routing_result pong(timetable const& tt,
   // PING
   // ----
   constexpr auto const kGpu = std::is_same_v<AlgoState, gpu::gpu_raptor_state>;
+  auto const use_pattern_replay =
+      !kGpu && replay_mode == pong_replay_mode::kNonRtPing &&
+      (rtt == nullptr || rtt->n_rt_transports() == 0U);
+  auto replay_cache = pong_replay_cache{};
 
   auto ping_dist_to_dest = std::vector<std::uint16_t>{};
   auto ping_is_dest = bitvec{};
@@ -265,6 +270,14 @@ routing_result pong(timetable const& tt,
         (kFwd ? 1 : -1) *
             std::min(q.max_travel_time_ + kMinLookAhead, kMaxTravelTime);
     auto ping_results = pareto_set<journey>{};
+    if constexpr (!kGpu) {
+      if (use_pattern_replay) {
+        for (auto const& bound : replay_cache.get_destination_bounds(
+                 tt, SearchDir, start_time, worst_time_at_dest)) {
+          ping.seed_destination_bound(bound.transfers_, bound.time_);
+        }
+      }
+    }
     ping.execute(start_time, q.max_transfers_, worst_time_at_dest,
                  ping_results);
     kFwd ? ++result.search_stats_.n_execute_fwd_
@@ -336,6 +349,9 @@ routing_result pong(timetable const& tt,
                  ping_j.start_time_, match->dest_time_);
       if (!match->is_reconstructed_ && !match->error_) {
         po.reconstruct(q, *match);
+      }
+      if (use_pattern_replay && match->is_reconstructed_ && !match->error_) {
+        replay_cache.add_journey(tt, *match);
       }
       ping_j.start_time_ = match->dest_time_;
     };
@@ -479,39 +495,40 @@ routing_result pong_with_vias(timetable const& tt,
                               search_state& s_state,
                               AlgoState& r_state,
                               query q,
-                              std::optional<std::chrono::seconds> timeout) {
+                              std::optional<std::chrono::seconds> timeout,
+                              pong_replay_mode const replay_mode) {
   if (rtt == nullptr) {
     return pong<SearchDir, false, Vias>(tt, rtt, s_state, r_state, std::move(q),
-                                        timeout);
+                                        timeout, replay_mode);
   } else {
     return pong<SearchDir, true, Vias>(tt, rtt, s_state, r_state, std::move(q),
-                                       timeout);
+                                       timeout, replay_mode);
   }
 }
 
 template <direction SearchDir, typename AlgoState>
-routing_result pong_search_with_dir(
-    timetable const& tt,
-    rt_timetable const* rtt,
-    search_state& s_state,
-    AlgoState& r_state,
-    query q,
-    std::optional<std::chrono::seconds> timeout) {
+routing_result pong_search_with_dir(timetable const& tt,
+                                    rt_timetable const* rtt,
+                                    search_state& s_state,
+                                    AlgoState& r_state,
+                                    query q,
+                                    std::optional<std::chrono::seconds> timeout,
+                                    pong_replay_mode const replay_mode) {
   if constexpr (std::is_same_v<AlgoState, gpu::gpu_raptor_state>) {
     utl::verify(q.via_stops_.empty(), "GPU raptor does not support vias");
     return pong_with_vias<SearchDir, 0>(tt, rtt, s_state, r_state, std::move(q),
-                                        timeout);
+                                        timeout, replay_mode);
   } else {
     switch (q.via_stops_.size()) {
       case 0:
         return pong_with_vias<SearchDir, 0>(tt, rtt, s_state, r_state,
-                                            std::move(q), timeout);
+                                            std::move(q), timeout, replay_mode);
       case 1:
         return pong_with_vias<SearchDir, 1>(tt, rtt, s_state, r_state,
-                                            std::move(q), timeout);
+                                            std::move(q), timeout, replay_mode);
       case 2:
         return pong_with_vias<SearchDir, 2>(tt, rtt, s_state, r_state,
-                                            std::move(q), timeout);
+                                            std::move(q), timeout, replay_mode);
     }
     throw utl::fail("{} vias not supported (max={})", kMaxVias);
   }
@@ -524,13 +541,14 @@ routing_result pong_search(timetable const& tt,
                            AlgoState& r_state,
                            query q,
                            direction search_dir,
-                           std::optional<std::chrono::seconds> timeout) {
+                           std::optional<std::chrono::seconds> timeout,
+                           pong_replay_mode const replay_mode) {
   if (search_dir == direction::kForward) {
-    return pong_search_with_dir<direction::kForward>(tt, rtt, s_state, r_state,
-                                                     std::move(q), timeout);
+    return pong_search_with_dir<direction::kForward>(
+        tt, rtt, s_state, r_state, std::move(q), timeout, replay_mode);
   } else {
-    return pong_search_with_dir<direction::kBackward>(tt, rtt, s_state, r_state,
-                                                      std::move(q), timeout);
+    return pong_search_with_dir<direction::kBackward>(
+        tt, rtt, s_state, r_state, std::move(q), timeout, replay_mode);
   }
 }
 
@@ -540,7 +558,8 @@ template routing_result pong_search(timetable const&,
                                     raptor_state&,
                                     query,
                                     direction,
-                                    std::optional<std::chrono::seconds>);
+                                    std::optional<std::chrono::seconds>,
+                                    pong_replay_mode);
 
 #if defined(NIGIRI_CUDA)
 template routing_result pong_search(timetable const&,
@@ -549,7 +568,8 @@ template routing_result pong_search(timetable const&,
                                     gpu::gpu_raptor_state&,
                                     query,
                                     direction,
-                                    std::optional<std::chrono::seconds>);
+                                    std::optional<std::chrono::seconds>,
+                                    pong_replay_mode);
 #endif
 
 }  // namespace nigiri::routing

@@ -413,6 +413,13 @@ struct raptor {
     });
   }
 
+  void seed_destination_bound(std::uint8_t const transfers,
+                              unixtime_t const time_at_dest) {
+    assert(transfers <= kMaxTransfers);
+    update_time_at_dest(static_cast<unsigned>(transfers) + 1U,
+                        unix_to_delta(base(), time_at_dest));
+  }
+
   void reconstruct(query const& q, journey& j) {
     if constexpr (SearchMode == search_mode::kOneToAll) {
       return;
